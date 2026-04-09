@@ -28,7 +28,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'HF_TOKEN missing in Vercel' });
   }
 
-  const { prompt, history = [], model = 'Qwen/Qwen2.5-Coder-7B-Instruct', mode = 'deep' } = req.body || {};
+  const body = (req.body || {}) as any;
+  const { prompt, history = [], model = 'Qwen/Qwen2.5-Coder-7B-Instruct', mode = 'deep' } = body;
   
   const hf = new HfInference(hfToken);
 
