@@ -1,7 +1,6 @@
-export const config = {
-  runtime: 'edge', // Usa Edge Runtime da Vercel para permitir Streaming ilimitado/imediato sem timeout
-};
+export const maxDuration = 60; // 60s max execution for typical AI
 
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { HfInference } from '@huggingface/inference';
 
 const MASTER_SYSTEM_PROMPT = `You are OpenCode — an elite software engineering system. 
@@ -18,135 +17,126 @@ const AGENT_PROMPTS = {
   security: `YOUR ROLE: Agent.Security_Auditor. Review code strictly for memory leaks, injections, type safety, and race conditions. Pass if everything is production-ready.`,
 };
 
-export default async function handler(req: Request) {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
-    return new Response(JSON.stringify({ error: 'Method Not Allowed' }), { status: 405 });
+    return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
   // HF Token da Vercel
   const hfToken = process.env.HF_TOKEN;
   if (!hfToken) {
-    return new Response(JSON.stringify({ error: 'HF_TOKEN missing in Vercel' }), { status: 500 });
+    return res.status(500).json({ error: 'HF_TOKEN missing in Vercel' });
   }
 
-  const payload = await req.json();
-  const { prompt, history = [], model = 'Qwen/Qwen2.5-Coder-7B-Instruct', mode = 'deep' } = payload;
+  const { prompt, history = [], model = 'Qwen/Qwen2.5-Coder-7B-Instruct', mode = 'deep' } = req.body || {};
   
   const hf = new HfInference(hfToken);
 
-  const encoder = new TextEncoder();
+  // Setup Server-Sent Events headers natively
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
 
-  // Cria um ReadableStream (padrão web) que a Vercel adora e streama em tempo real
-  const customStream = new ReadableStream({
-    async start(controller) {
-      const sendEvent = (data: any) => {
-        const str = `data: ${JSON.stringify(data)}\n\n`;
-        controller.enqueue(encoder.encode(str));
-      };
+  const sendEvent = (data: any) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    (res as any).flush?.(); // Explicit Vercel native flush
+  };
 
-      try {
-        sendEvent({ type: 'phase', phase: 'analyzing' });
+  try {
+    sendEvent({ type: 'phase', phase: 'analyzing' });
 
-        if (mode === 'fast') {
-          // ── FAST MODE ──
-          sendEvent({ type: 'phase', phase: 'coding' });
-          sendEvent({ type: 'stream_start', agent: 'OpenCode' });
-          
-          const stream = hf.chatCompletionStream({
-            model,
-            messages: [{ role: 'system', content: MASTER_SYSTEM_PROMPT }, ...history, { role: 'user', content: prompt }],
-            max_tokens: 2000,
-          });
+    if (mode === 'fast') {
+      sendEvent({ type: 'phase', phase: 'coding' });
+      sendEvent({ type: 'stream_start', agent: 'OpenCode' });
+      
+      const stream = hf.chatCompletionStream({
+        model,
+        messages: [{ role: 'system', content: MASTER_SYSTEM_PROMPT }, ...history, { role: 'user', content: prompt }],
+        max_tokens: 2000,
+      });
 
-          let full = '';
-          for await (const chunk of stream) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            full += token;
-            sendEvent({ type: 'token', token });
-          }
-
-          sendEvent({ type: 'stream_end', agent: 'OpenCode', content: full, final: true });
-
-        } else {
-          // ── DEEP MODE (Multi-Agente) ──
-          // Step 1: Analyst
-          sendEvent({ type: 'phase', phase: 'thinking' });
-          sendEvent({ type: 'stream_start', agent: 'Analyst 🧠' });
-          let analystOutput = '';
-          let stream1 = hf.chatCompletionStream({
-            model,
-            messages: [
-              { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.analyst },
-              ...history,
-              { role: 'user', content: prompt }
-            ],
-            max_tokens: 1500,
-          });
-          for await (const chunk of stream1) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            analystOutput += token;
-            sendEvent({ type: 'token', token });
-          }
-          sendEvent({ type: 'stream_end', agent: 'Analyst 🧠', content: analystOutput });
-
-          // Step 2: Coder
-          sendEvent({ type: 'phase', phase: 'coding' });
-          sendEvent({ type: 'stream_start', agent: 'Senior Coder 💻' });
-          let coderOutput = '';
-          let stream2 = hf.chatCompletionStream({
-            model,
-            messages: [
-              { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.coder },
-              ...history,
-              { role: 'user', content: prompt },
-              { role: 'assistant', content: analystOutput },
-              { role: 'user', content: `Please implement the exact solution based on your plan.` }
-            ],
-            max_tokens: 2500,
-          });
-          for await (const chunk of stream2) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            coderOutput += token;
-            sendEvent({ type: 'token', token });
-          }
-          sendEvent({ type: 'stream_end', agent: 'Senior Coder 💻', content: coderOutput });
-
-          // Step 3: Auditor
-          sendEvent({ type: 'phase', phase: 'auditing' });
-          sendEvent({ type: 'stream_start', agent: 'Security Auditor 🔍' });
-          let auditOutput = '';
-          let stream3 = hf.chatCompletionStream({
-            model,
-            messages: [
-              { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.security },
-              { role: 'user', content: `Audit this code:\n\n${coderOutput}` }
-            ],
-            max_tokens: 1000,
-          });
-          for await (const chunk of stream3) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            auditOutput += token;
-            sendEvent({ type: 'token', token });
-          }
-          sendEvent({ type: 'stream_end', agent: 'Security Auditor 🔍', content: auditOutput, final: true });
+      let full = '';
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content || '';
+        if (token) {
+           full += token;
+           sendEvent({ type: 'token', token });
         }
-
-        sendEvent({ type: 'phase', phase: 'done' });
-        controller.close();
-      } catch (error: any) {
-        // Se ocorrer qualquer erro (API rate limit, timeout da HF) enviamos pro chat.
-        sendEvent({ type: 'error', message: error.message || 'Hugging Face API Error' });
-        sendEvent({ type: 'phase', phase: 'error' });
-        controller.close();
       }
-    }
-  });
 
-  return new Response(customStream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      'Connection': 'keep-alive',
-    },
-  });
+      sendEvent({ type: 'stream_end', agent: 'OpenCode', content: full, final: true });
+
+    } else {
+      // Step 1: Analyst
+      sendEvent({ type: 'phase', phase: 'thinking' });
+      sendEvent({ type: 'stream_start', agent: 'Analyst 🧠' });
+      let analystOutput = '';
+      let stream1 = hf.chatCompletionStream({
+        model,
+        messages: [
+          { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.analyst },
+          ...history,
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 1500,
+      });
+      for await (const chunk of stream1) {
+        const token = chunk.choices[0]?.delta?.content || '';
+        analystOutput += token;
+        sendEvent({ type: 'token', token });
+      }
+      sendEvent({ type: 'stream_end', agent: 'Analyst 🧠', content: analystOutput });
+
+      // Step 2: Coder
+      sendEvent({ type: 'phase', phase: 'coding' });
+      sendEvent({ type: 'stream_start', agent: 'Senior Coder 💻' });
+      let coderOutput = '';
+      let stream2 = hf.chatCompletionStream({
+        model,
+        messages: [
+          { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.coder },
+          ...history,
+          { role: 'user', content: prompt },
+          { role: 'assistant', content: analystOutput },
+          { role: 'user', content: `Please implement the exact solution based on your plan.` }
+        ],
+        max_tokens: 2500,
+      });
+      for await (const chunk of stream2) {
+        const token = chunk.choices[0]?.delta?.content || '';
+        coderOutput += token;
+        sendEvent({ type: 'token', token });
+      }
+      sendEvent({ type: 'stream_end', agent: 'Senior Coder 💻', content: coderOutput });
+
+      // Step 3: Auditor
+      sendEvent({ type: 'phase', phase: 'auditing' });
+      sendEvent({ type: 'stream_start', agent: 'Security Auditor 🔍' });
+      let auditOutput = '';
+      let stream3 = hf.chatCompletionStream({
+        model,
+        messages: [
+          { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.security },
+          { role: 'user', content: `Audit this code:\n\n${coderOutput}` }
+        ],
+        max_tokens: 1000,
+      });
+      for await (const chunk of stream3) {
+        const token = chunk.choices[0]?.delta?.content || '';
+        auditOutput += token;
+        sendEvent({ type: 'token', token });
+      }
+      sendEvent({ type: 'stream_end', agent: 'Security Auditor 🔍', content: auditOutput, final: true });
+    }
+
+    sendEvent({ type: 'phase', phase: 'done' });
+    res.end();
+  } catch (error: any) {
+    sendEvent({ type: 'error', message: error.message || 'Hugging Face API Error' });
+    sendEvent({ type: 'phase', phase: 'error' });
+    res.end();
+  }
 }
