@@ -44,97 +44,113 @@ export default async function handler(req: Request) {
         controller.enqueue(encoder.encode(str));
       };
 
+      // Helpper to call HF using native fetch
+      const callHf = async (messages: any[], max_tokens: number, agentName: string) => {
+        sendEvent({ type: 'stream_start', agent: agentName });
+        
+        const response = await fetch("https://router.huggingface.co/hf-inference/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${hfToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            max_tokens,
+            stream: true
+          })
+        });
+
+        if (!response.ok) {
+           const errText = await response.text();
+           throw new Error(`HF API HTTP ${response.status}: ${errText}`);
+        }
+
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("No stream content from HF");
+        
+        const dec = new TextDecoder();
+        let fullContent = '';
+        let buf = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          buf += dec.decode(value, { stream: true });
+          const parts = buf.split('\n\n');
+          buf = parts.pop() || '';
+          
+          for (const line of parts) {
+            if (line.startsWith('data: ')) {
+               const dataStr = line.slice(6).trim();
+               if (dataStr === '[DONE]') continue;
+               try {
+                 const data = JSON.parse(dataStr);
+                 const token = data.choices[0]?.delta?.content || '';
+                 if (token) {
+                   fullContent += token;
+                   sendEvent({ type: 'token', token });
+                 }
+               } catch (e) {
+                 // ignore parse errors for partial chunks
+               }
+            }
+          }
+        }
+        return fullContent;
+      };
+
       try {
         sendEvent({ type: 'phase', phase: 'analyzing' });
 
         if (mode === 'fast') {
-          // ── FAST MODE ──
           sendEvent({ type: 'phase', phase: 'coding' });
-          sendEvent({ type: 'stream_start', agent: 'OpenCode' });
-          
-          const stream = hf.chatCompletionStream({
-            model,
-            messages: [{ role: 'system', content: MASTER_SYSTEM_PROMPT }, ...history, { role: 'user', content: prompt }],
-            max_tokens: 2000,
-          });
-
-          let full = '';
-          for await (const chunk of stream) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            full += token;
-            sendEvent({ type: 'token', token });
-          }
-
-          sendEvent({ type: 'stream_end', agent: 'OpenCode', content: full, final: true });
+          const out = await callHf(
+            [{ role: 'system', content: MASTER_SYSTEM_PROMPT }, ...history, { role: 'user', content: prompt }],
+            2000, 'OpenCode'
+          );
+          sendEvent({ type: 'stream_end', agent: 'OpenCode', content: out, final: true });
 
         } else {
-          // ── DEEP MODE (Multi-Agente) ──
           // Step 1: Analyst
           sendEvent({ type: 'phase', phase: 'thinking' });
-          sendEvent({ type: 'stream_start', agent: 'Analyst 🧠' });
-          let analystOutput = '';
-          let stream1 = hf.chatCompletionStream({
-            model,
-            messages: [
-              { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.analyst },
-              ...history,
-              { role: 'user', content: prompt }
-            ],
-            max_tokens: 1500,
-          });
-          for await (const chunk of stream1) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            analystOutput += token;
-            sendEvent({ type: 'token', token });
-          }
+          const analystOutput = await callHf(
+            [{ role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.analyst }, ...history, { role: 'user', content: prompt }],
+            1500, 'Analyst 🧠'
+          );
           sendEvent({ type: 'stream_end', agent: 'Analyst 🧠', content: analystOutput });
 
           // Step 2: Coder
           sendEvent({ type: 'phase', phase: 'coding' });
-          sendEvent({ type: 'stream_start', agent: 'Senior Coder 💻' });
-          let coderOutput = '';
-          let stream2 = hf.chatCompletionStream({
-            model,
-            messages: [
+          const coderOutput = await callHf(
+            [
               { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.coder },
               ...history,
               { role: 'user', content: prompt },
               { role: 'assistant', content: analystOutput },
               { role: 'user', content: `Please implement the exact solution based on your plan.` }
             ],
-            max_tokens: 2500,
-          });
-          for await (const chunk of stream2) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            coderOutput += token;
-            sendEvent({ type: 'token', token });
-          }
+            2500, 'Senior Coder 💻'
+          );
           sendEvent({ type: 'stream_end', agent: 'Senior Coder 💻', content: coderOutput });
 
           // Step 3: Auditor
           sendEvent({ type: 'phase', phase: 'auditing' });
-          sendEvent({ type: 'stream_start', agent: 'Security Auditor 🔍' });
-          let auditOutput = '';
-          let stream3 = hf.chatCompletionStream({
-            model,
-            messages: [
+          const auditOutput = await callHf(
+            [
               { role: 'system', content: MASTER_SYSTEM_PROMPT + '\n' + AGENT_PROMPTS.security },
               { role: 'user', content: `Audit this code:\n\n${coderOutput}` }
             ],
-            max_tokens: 1000,
-          });
-          for await (const chunk of stream3) {
-            const token = chunk.choices[0]?.delta?.content || '';
-            auditOutput += token;
-            sendEvent({ type: 'token', token });
-          }
+            1000, 'Security Auditor 🔍'
+          );
           sendEvent({ type: 'stream_end', agent: 'Security Auditor 🔍', content: auditOutput, final: true });
         }
 
         sendEvent({ type: 'phase', phase: 'done' });
         controller.close();
       } catch (error: any) {
-        // Se ocorrer qualquer erro (API rate limit, timeout da HF) enviamos pro chat.
         sendEvent({ type: 'error', message: error.message || 'Hugging Face API Error' });
         sendEvent({ type: 'phase', phase: 'error' });
         controller.close();
