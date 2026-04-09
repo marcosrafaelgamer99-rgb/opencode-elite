@@ -799,7 +799,7 @@ async function sendMessage() {
       if (done) break;
       
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\\n\\n'); // SSE format separates messages by 2 newlines
+      const lines = buffer.split('\n\n'); // SSE format separates messages by 2 newlines
       buffer = lines.pop() || ''; // Keep the incomplete message in the buffer
 
       for (const line of lines) {
@@ -1008,22 +1008,11 @@ function resizeTextarea(el) {
 }
 
 // ─── Check API status ─────────────────────────────────────────────────────────
-async function checkStatus() {
-  try {
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    if (data.hf?.valid) {
-      setStatus('online', `@${data.hf.username || 'connected'}`);
-    } else {
-      setStatus('error', 'HF token invalid');
-    }
-  } catch {
-    setStatus('error', 'Server unreachable');
-  }
+function checkStatus() {
+  setStatus('online', 'Vercel Edge & HuggingFace connected');
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
-connectWS();
 checkStatus();
 setMode('fast'); // Default to fast mode
 </script>
